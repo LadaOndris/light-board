@@ -1,7 +1,19 @@
+/*
+ * main.c
+ *
+ *  Created on: 24 Oct 2020
+ *      Author: Ladislav Ondris
+ *      Email: xondri07@vutbr.cz
+ *
+ *  A simple application that displays moving text on a matrix display.
+ *  It is controlled by Kinetis K60.
+ */
+
 /* Header file with all the essential definitions for a given type of MCU */
 #include "MK60D10.h"
 #include "display.h"
 #include "messages.h"
+#include "string.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -9,11 +21,19 @@
 /* Macros for bit-level registers manipulation */
 #define GPIO_PIN_MASK	0x1Fu
 #define GPIO_PIN(x)		(((1)<<(x & GPIO_PIN_MASK)))
+
+/** GPIO pins for controlling columns of the display.
+ *  There are 16 columns, but only 4 pins.
+ *  Pins represent binary number 0-15.
+ */
 #define PTA_COLS_MASK	(GPIO_PDOR_PDO(GPIO_PIN(8)) | \
 						 GPIO_PDOR_PDO(GPIO_PIN(10)) | \
 						 GPIO_PDOR_PDO(GPIO_PIN(6)) | \
 						 GPIO_PDOR_PDO(GPIO_PIN(11)))
 
+/** GPIO pins for controlling rows of the display.
+ * There are 8 rows. Each pin activates a single row.
+ * */
 #define PTA_ROWS_MASK	(GPIO_PDOR_PDO(GPIO_PIN(26)) | \
 						 GPIO_PDOR_PDO(GPIO_PIN(24)) | \
 						 GPIO_PDOR_PDO(GPIO_PIN(9)) | \
@@ -25,34 +45,37 @@
 
 #define BTN_SW2 0x400     // Port E, bit 10
 #define BTN_SW4 0x8000000 // Port E, bit 27
+#define BTN_SW2_PCR_INDEX 10
+#define BTN_SW4_PCR_INDEX 27
 
-/* Constants specifying delay loop duration */
-#define	tdelay1			10000
-#define tdelay2 		20
-
+/* Contains display information such as the text that is being displayed. */
 static display_t display;
+/* Holds texts that can be displayed. */
+static messenger_t messenger;
+/* A variable keeping text inputed via UART to be displayed. */
+static string_t string_buffer;
+/* The column that is currently being displayed. It is controlled by PIT1's IRQ. */
 static unsigned column_index;
 
 /* Configuration of the necessary MCU peripherals */
-void SystemConfig() {
+void SystemConfig()
+{
+    MCG_C4 |= ( MCG_C4_DMX32_MASK | MCG_C4_DRST_DRS(0x01) );
+    SIM_CLKDIV1 |= SIM_CLKDIV1_OUTDIV1(0x00);
+    WDOG_STCTRLH &= ~WDOG_STCTRLH_WDOGEN_MASK; // turn off watchdog
 
-	// Selects the clock source for the UART0 transmit and receive clock.
-	//SIM->SOPT2 |= SIM_SOPT2_UART0SRC(0x01);
 	/* Turn on all port clocks */
-	SIM->SCGC5 = SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTE_MASK | SIM_SCGC5_PORTB_MASK;
+	SIM->SCGC5 = SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTE_MASK;
 	// Enable clock for PIT
 	SIM->SCGC6 |= SIM_SCGC6_PIT_MASK;
 	// Enable clock for UART
-	SIM->SCGC4 |= SIM_SCGC4_UART0_MASK;
+    SIM->SCGC1 = SIM_SCGC1_UART5_MASK;
 
-
-	/* Set corresponding PTA pins (column activators of 74HC154) for GPIO functionality */
+	// Port A
 	PORTA->PCR[8] = ( 0|PORT_PCR_MUX(0x01) );  // A0
 	PORTA->PCR[10] = ( 0|PORT_PCR_MUX(0x01) ); // A1
 	PORTA->PCR[6] = ( 0|PORT_PCR_MUX(0x01) );  // A2
 	PORTA->PCR[11] = ( 0|PORT_PCR_MUX(0x01) ); // A3
-
-	/* Set corresponding PTA pins (rows selectors of 74HC154) for GPIO functionality */
 	PORTA->PCR[26] = ( 0|PORT_PCR_MUX(0x01) );  // R0
 	PORTA->PCR[24] = ( 0|PORT_PCR_MUX(0x01) );  // R1
 	PORTA->PCR[9] = ( 0|PORT_PCR_MUX(0x01) );   // R2
@@ -62,21 +85,28 @@ void SystemConfig() {
 	PORTA->PCR[27] = ( 0|PORT_PCR_MUX(0x01) );  // R6
 	PORTA->PCR[29] = ( 0|PORT_PCR_MUX(0x01) );  // R7
 
-	/* Set corresponding PTE pins (output enable of 74HC154) for GPIO functionality */
-	PORTE->PCR[28] = ( 0|PORT_PCR_MUX(0x01) ); // #EN
+	// Port E
+	PORTE->PCR[8]  = PORT_PCR_MUX(0x03); // UART5_TX
+    PORTE->PCR[9]  = PORT_PCR_MUX(0x03); // UART5_RX
+	PORTE->PCR[28] = (0 | PORT_PCR_MUX(0x01)); // # EN
 
-    PORTE->PCR[10] = PORT_PCR_MUX(0x01); // Button SW2
-    PORTE->PCR[27] = PORT_PCR_MUX(0x01); // Button SW4
-
-	PORTB->PCR[1] = ( 0 | PORT_PCR_MUX(0x02) );	// UART0_TX
-	PORTB->PCR[2] = ( 0 | PORT_PCR_MUX(0x02) ); // UART0_RX
-
+    int btns[2] = { BTN_SW2_PCR_INDEX, BTN_SW4_PCR_INDEX };
+    for (int i = 0; i < 2; i++) {
+		PORTE->PCR[btns[i]] = ( PORT_PCR_ISF(0x01) /* Zero-out ISF (Interrupt Status Flag) */
+						| PORT_PCR_IRQC(0x0A) /* Interrupt enable on falling edge */
+						| PORT_PCR_MUX(0x01) /* Pin Mux Control to GPIO */
+						| PORT_PCR_PE(0x01) /* Pull resistor enable... */
+						| PORT_PCR_PS(0x01)); /* ...select Pull-Up */
+    }
 
 	/* Change corresponding PTA port pins as outputs */
 	PTA->PDDR = GPIO_PDDR_PDD(0x3F000FC0);
-
 	/* Change corresponding PTE port pins as outputs */
-	PTE->PDDR = GPIO_PDDR_PDD( GPIO_PIN(28) );
+	PTE->PDDR = GPIO_PDDR_PDD(GPIO_PIN(28));
+
+	/* Enable IRQ from PORTE (that is used for buttons) */
+	NVIC_ClearPendingIRQ(PORTE_IRQn);
+	NVIC_EnableIRQ(PORTE_IRQn);
 }
 
 
@@ -139,9 +169,7 @@ void PIT0_IRQHandler()
  */
 void PIT1_IRQHandler()
 {
-
 	PTE->PDDR &= ~GPIO_PDDR_PDD( GPIO_PIN(28) );
-
 	PTA->PDOR &= ~PTA_ROWS_MASK; // disable all row pins
 
 	select_column(column_index);
@@ -165,6 +193,7 @@ void PITInit()
 	PIT_TCTRL0 = PIT_TCTRL_TIE_MASK; // enable Timer 1 interrupts
 	PIT_TCTRL0 |= PIT_TCTRL_TEN_MASK; // start Timer 1
 
+	NVIC_ClearPendingIRQ(PIT0_IRQn);
     NVIC_EnableIRQ(PIT0_IRQn); // enable interrupts from PIT0
 
 	PIT_LDVAL1 = 0x3E7F; // 15 999 cycles, 0.32  ms
@@ -172,87 +201,120 @@ void PITInit()
 	PIT_TCTRL1 = PIT_TCTRL_TIE_MASK; // enable Timer 1 interrupts
 	PIT_TCTRL1 |= PIT_TCTRL_TEN_MASK; // start Timer 1
 
+	NVIC_ClearPendingIRQ(PIT1_IRQn);
     NVIC_EnableIRQ(PIT1_IRQn); // enable interrupts from PIT1
 }
-/**
-void UART0Init()
-{
-	UART0->C2 &= ~(UART0_C2_TE_MASK | UART0_C2_RE_MASK); // Disable transmitter and receiver
 
-	UART0->BDH = 0x00;
-	UART0->BDL = 0x1A;	// Baud rate 115 200 Bd, 1 stop bit
-	UART0->C4 = 0x0F;	// Oversampling ratio 16, match address mode disabled
 
-	UART0->C1 = 0x00;	// 8 bits, and without a parity bit
-	UART0->C3 = 0x00;
-	UART0->MA1 = 0x00;	// no match address (mode disabled in C4)
-	UART0->MA2 = 0x00;	// no match address (mode disabled in C4)
-	UART0->S1 |= 0x1F;
-	UART0->S2 |= 0xC0;
-
-	UART0->C2 |= ( UART0_C2_TE_MASK | UART0_C2_RE_MASK );	// Enable transmitter and receiver
+unsigned char receive_char() {
+    while(!(UART5->S1 & UART_S1_RDRF_MASK));
+    return UART5->D;
 }
 
-void SendChar(char ch)
-{
-    while (!(UART0->S1 & UART0_S1_TDRE_MASK) && !(UART0->S1 & UART0_S1_TC_MASK));
-    UART0->D = ch;
+void send_char(char c) {
+    while(!(UART5->S1 & UART_S1_TDRE_MASK) && !(UART5->S1 & UART_S1_TC_MASK));
+    UART5->D = c;
 }
 
-char ReceiveChar(void)
-{
-	while (!(UART0->S1 & UART0_S1_RDRF_MASK));
-	return UART0->D;
-}
-
-void SendString(char *s)
+void send_string(char *s)
 {
 	for (int i = 0; s[i] != 0; i++) {
-		SendChar(s[i]);
+		send_char(s[i]);
 	}
 }
-*/
+
+void send_line(char *s)
+{
+	send_string(s);
+	send_string("\r\n");
+}
+
+bool received_char()
+{
+	return UART5->S1 & UART_S1_RDRF_MASK;
+}
+
+
+void UART5_RX_TX_IRQHandler()
+{
+	if (received_char()) {
+		char c = UART5->D;
+		send_char(c);
+
+		/* Append char to existing buffer */
+		string_add_char(&string_buffer, c);
+
+		/* The received string is whole.
+		 * It can be now displayed.
+		 */
+		if (c == '\r' || c == '\n') {
+			send_line("");
+			display_set_text(&display, string_buffer.string);
+
+			string_free(&string_buffer);
+			string_init(&string_buffer);
+
+			send_string("Type text to display: ");
+		}
+	}
+}
+
+void UART5Init()
+{
+    UART5->C2  &= ~(UART_C2_TE_MASK | UART_C2_RE_MASK);
+    UART5->BDH =  0x00;
+    UART5->BDL =  0x1A; // Baud rate 115 200 Bd, 1 stop bit
+    UART5->C4  =  0x0F; // Oversampling ratio 16, match address mode disabled
+    UART5->C1  =  0x00; // 8 data bitu, bez parity
+    UART5->C3  =  0x00;
+    UART5->MA1 =  0x00; // no match address (mode disabled in C4)
+    UART5->MA2 =  0x00; // no match address (mode disabled in C4)
+    UART5->S2  |= 0xC0;
+    UART5->C2  |= (UART_C2_TE_MASK | UART_C2_RE_MASK); // Zapnout vysilac i prijimac
+	UART5->C2 |= UART_C2_RIE_MASK; // enable interrupts from receiver
+
+	NVIC_ClearPendingIRQ(UART5_RX_TX_IRQn);
+	NVIC_EnableIRQ(UART5_RX_TX_IRQn);
+}
+
+void PORTE_IRQHandler()
+{
+	delay(2000, 1); // Wait a few ms for the signal oscillation to stop
+
+	// Interrupt from BTN_SW2 and log. 0 is on the input.
+ 	if ((PORTE_ISFR  & BTN_SW2) && !(GPIOE_PDIR & BTN_SW2)) {
+		char *msg = messenger_get_next(&messenger);
+		display_set_text(&display, msg);
+	}
+ 	// Interrupt from BTN_SW2 and log. 0 is on the input.
+	if ((PORTE_ISFR  & BTN_SW4) && !(GPIOE_PDIR & BTN_SW4)) {
+		char *msg = messenger_get_previous(&messenger);
+		display_set_text(&display, msg);
+	}
+	PORTE_ISFR = ~0; // Writes all ones to clear
+}
+
+
 int main(void)
 {
 	SystemConfig();
 	PITInit();
-	//UART0Init();
+	UART5Init();
 
-	delay(tdelay1, tdelay2);
+	delay(10000, 20);
+
+	send_line("\nApplication has started...");
+	send_string("Type text to display: ");
+
+	string_init(&string_buffer);
 
 	char *messages[] = { "xondri07", "42", "69" };
-	messenger_t messenger;
 	messenger_init(&messenger, messages, 3);
 
 	display_init(&display);
 	display_set_text(&display, messenger_get_next(&messenger));
 
-	bool btn_sw2_pressed = false;
-	bool btn_sw4_pressed = false;
-
-	while (1) {
-		if (!btn_sw2_pressed && !(GPIOE_PDIR & BTN_SW2))
-		{
-			btn_sw2_pressed = true;
-			char *msg = messenger_get_next(&messenger);
-			display_set_text(&display, msg);
-		}
-		else if (GPIOE_PDIR & BTN_SW2) {
-			btn_sw2_pressed = false;
-		}
-
-		if (!btn_sw4_pressed && !(GPIOE_PDIR & BTN_SW4))
-		{
-			btn_sw4_pressed = true;
-			char *msg = messenger_get_previous(&messenger);
-			display_set_text(&display, msg);
-		}
-		else if (GPIOE_PDIR & BTN_SW4) {
-			btn_sw4_pressed = false;
-		}
-	}
-
+	while (1);
 	display_free(&display);
-
     return 0;
 }

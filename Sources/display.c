@@ -2,7 +2,8 @@
  * display.c
  *
  *  Created on: 24 Oct 2020
- *      Author: ladis
+ *      Author: Ladislav Ondris
+ *      Email: xondri07@vutbr.cz
  */
 
 #include "display.h"
