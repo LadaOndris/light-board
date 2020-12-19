@@ -60,8 +60,8 @@ static unsigned column_index;
 /* Configuration of the necessary MCU peripherals */
 void SystemConfig()
 {
-    MCG_C4 |= ( MCG_C4_DMX32_MASK | MCG_C4_DRST_DRS(0x01) );
-    SIM_CLKDIV1 |= SIM_CLKDIV1_OUTDIV1(0x00);
+    MCG_C4 |= (MCG_C4_DMX32_MASK | MCG_C4_DRST_DRS(0x01));
+    SIM_CLKDIV1 |= SIM_CLKDIV1_OUTDIV1(0x00); // set clock divider - divide by 1
     WDOG_STCTRLH &= ~WDOG_STCTRLH_WDOGEN_MASK; // turn off watchdog
 
 	/* Turn on all port clocks */
@@ -111,15 +111,15 @@ void SystemConfig()
 
 
 /* Variable delay loop */
-void delay(int t1, int t2)
+void delay(int t1)
 {
-	int i, j;
-
-	for(i=0; i<t1; i++) {
-		for(j=0; j<t2; j++);
-	}
+	for (int i = 0; i < t1; i++);
 }
 
+/**
+ * Zeros out all given GPIO pins
+ * and sets them based on given num parameter.
+ */
 void select_gpio_pins(unsigned const *gpio_pins, const unsigned pins_count,
 		uint32_t selection_mask, const unsigned num)
 {
@@ -138,6 +138,9 @@ void select_gpio_pins(unsigned const *gpio_pins, const unsigned pins_count,
 	PTA->PDOR &= selection; // select pins
 }
 
+/**
+ * Select columns of the display.
+ */
 void select_column(unsigned int col_num)
 {
 	unsigned const GPIO_PINS_COUNT = 4;
@@ -145,6 +148,9 @@ void select_column(unsigned int col_num)
 	select_gpio_pins(GPIO_PINS, GPIO_PINS_COUNT, PTA_COLS_MASK, col_num);
 }
 
+/**
+ * Select rows of the display.
+ */
 void select_rows(unsigned int rows)
 {
 	unsigned const GPIO_PINS_COUNT = 8;
@@ -188,21 +194,21 @@ void PITInit()
 {
 	PIT_MCR = 0x00; // turn on PIT
 
-	PIT_LDVAL0 = 0x4C4B3F; // 4 999 999 cycles, 100 ms
+	PIT_LDVAL0 = 0x927BFF; // 9 599 999 cycles, 104 ms
 	PIT_TFLG0 |= PIT_TFLG_TIF_MASK; // clear interrupt
 	PIT_TCTRL0 = PIT_TCTRL_TIE_MASK; // enable Timer 1 interrupts
 	PIT_TCTRL0 |= PIT_TCTRL_TEN_MASK; // start Timer 1
 
 	NVIC_ClearPendingIRQ(PIT0_IRQn);
-    NVIC_EnableIRQ(PIT0_IRQn); // enable interrupts from PIT0
+	NVIC_EnableIRQ(PIT0_IRQn); // enable interrupts from PIT0
 
-	PIT_LDVAL1 = 0x3E7F; // 15 999 cycles, 0.32  ms
+	PIT_LDVAL1 = 0x3E7F; // 15 999 cycles, 0.33  ms
 	PIT_TFLG1 |= PIT_TFLG_TIF_MASK; // clear interrupt
 	PIT_TCTRL1 = PIT_TCTRL_TIE_MASK; // enable Timer 1 interrupts
 	PIT_TCTRL1 |= PIT_TCTRL_TEN_MASK; // start Timer 1
 
 	NVIC_ClearPendingIRQ(PIT1_IRQn);
-    NVIC_EnableIRQ(PIT1_IRQn); // enable interrupts from PIT1
+	NVIC_EnableIRQ(PIT1_IRQn); // enable interrupts from PIT1
 }
 
 
@@ -279,7 +285,7 @@ void UART5Init()
 
 void PORTE_IRQHandler()
 {
-	delay(2000, 1); // Wait a few ms for the signal oscillation to stop
+	delay(50000); // Wait for the signal oscillation to stop
 
 	// Interrupt from BTN_SW2 and log. 0 is on the input.
  	if ((PORTE_ISFR  & BTN_SW2) && !(GPIOE_PDIR & BTN_SW2)) {
@@ -294,6 +300,14 @@ void PORTE_IRQHandler()
 	PORTE_ISFR = ~0; // Writes all ones to clear
 }
 
+void send_info()
+{
+	send_line("Text on the display can be changed by pressing either the SW2, or the SW4 button.");
+	send_line("There are three predefined messages: 'xondri07', '42', and '69'.");
+	send_line("You can set a custom message by sending it via this interface.");
+	send_line("Don't worry, it can be changed any time while the application is running.");
+}
+
 
 int main(void)
 {
@@ -301,10 +315,14 @@ int main(void)
 	PITInit();
 	UART5Init();
 
-	delay(10000, 20);
+	delay(200000);
 
+	send_string("\033[2J\033[H"); // Clean the command line screen
 	send_line("\nApplication has started...");
-	send_string("Type text to display: ");
+	send_line("-----------------------------");
+	send_info();
+	send_line("-----------------------------");
+	send_string("\nType text to display: ");
 
 	string_init(&string_buffer);
 
